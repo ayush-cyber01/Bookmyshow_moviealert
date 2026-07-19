@@ -1,29 +1,31 @@
-name: booking-watch
+name: spidey-ticket-watch
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # manual trigger button, also hit remotely by cron-job.org
 
 permissions:
   contents: write
 
 concurrency:
-  group: booking-watch
+  group: spidey-ticket-watch
   cancel-in-progress: false
 
 jobs:
-  poll:
+  check-booking:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Grab the repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run poller
+      - name: Check BookMyShow + alert if open
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -31,14 +33,14 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python poller.py
 
-      - name: Persist state
+      - name: Save updated memory.json state
         run: |
           if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git config user.name "booking-watch-bot"
+            git config user.name "spidey-ticket-watch-bot"
             git config user.email "actions@users.noreply.github.com"
             git add state.json
-            git commit -m "chore: update booking-watch state [skip ci]"
+            git commit -m "bot: refresh watch state [skip ci]"
             git push
           else
-            echo "No state change."
+            echo "state unchanged, nothing to commit"
           fi
