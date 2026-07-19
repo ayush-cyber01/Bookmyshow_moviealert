@@ -1,9 +1,7 @@
 {
-  "detector": "venue_date",
-  "movie": "The Odyssey (IMAX 2D)",
-  "requested_date": "20260722",
-  "venue_code": "INPR",
-  "venue_label": "INOX: LUXE Phoenix Market City, Velachery",
-  "url_template": "https://in.bookmyshow.com/movies/chennai/the-odyssey/buytickets/ET00480917/{date}",
+  "detector": "bms_date",
+  "movie": "Spider-Man: Brand New Day",
+  "requested_date": "20260731",
+  "url_template": "https://in.bookmyshow.com/movies/chennai/spider-man-brand-new-day/buytickets/ET00502600/{date}",
   "min_references": 10
 }
