@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Ticket-booking watcher.
+Booking Watcher — by ayush-cyber01
 
-Polls a URL (a BookMyShow / District showtimes page, or an internal API
-request you grabbed from your browser's DevTools) and sends a Telegram
-message the moment a given theatre appears with booking open.
+Keeps an eye on a BookMyShow ticket page and fires off a Telegram alert
+the second booking flips open for the movie/theatre/date you've set in
+settings.json. A memory.json file remembers the last known state, so
+you get exactly one ping on the open transition instead of a flood of
+repeat alerts every run.
 
-State is tracked in state.json so you get alerted on the *transition*
-to "available" instead of on every run.
-
-Everything is driven by config.json (and/or environment variables), so
-nothing site-specific is hardcoded -- if BookMyShow/District change their
-markup you only edit config, not code.
+Every site-specific value (movie, date, theatre) lives in settings.json,
+not in this file — so switching targets is a config edit, not a code
+change.
 """
 
 import json
@@ -25,12 +24,13 @@ from pathlib import Path
 
 import requests
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", ROOT / "config.json"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", ROOT / "state.json"))
+BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_FILE = Path(os.environ.get("CONFIG_PATH", BASE_DIR / "config.json"))
+MEMORY_FILE = Path(os.environ.get("STATE_PATH", BASE_DIR / "state.json"))
 
-# Look like a real Chrome on Windows -- BMS rejects obvious bots.
-DEFAULT_HEADERS = {
+# Browser fingerprint so BookMyShow treats this like a normal Chrome visit
+# instead of flagging it as a script.
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -51,23 +51,23 @@ DEFAULT_HEADERS = {
 }
 
 
-def load_json(path, default=None):
+def read_json(path, fallback=None):
     if not path.exists():
-        return default
+        return fallback
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def save_json(path, data):
+def write_json(path, payload):
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+        json.dump(payload, fh, indent=2)
 
 
-def load_config():
-    cfg = load_json(CONFIG_PATH, default={}) or {}
+def get_settings():
+    """Load settings.json and layer any GitHub Actions secrets on top."""
+    settings = read_json(SETTINGS_FILE, fallback={}) or {}
 
-    # Environment variables override the file (used by GitHub Actions secrets).
-    env_map = {
+    secret_overrides = {
         "TARGET_URL": "target_url",
         "THEATRE": "theatre",
         "MOVIE": "movie",
@@ -75,229 +75,219 @@ def load_config():
         "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
         "TELEGRAM_CHAT_ID": "telegram_chat_id",
     }
-    for env_key, cfg_key in env_map.items():
-        if os.environ.get(env_key):
-            cfg[cfg_key] = os.environ[env_key]
+    for env_name, settings_key in secret_overrides.items():
+        if os.environ.get(env_name):
+            settings[settings_key] = os.environ[env_name]
 
     if os.environ.get("HEADERS_JSON"):
-        cfg["headers"] = json.loads(os.environ["HEADERS_JSON"])
+        settings["headers"] = json.loads(os.environ["HEADERS_JSON"])
 
-    # The BMS date is embedded in the URL, so build the URL from the template
-    # and the (possibly overridden) requested_date. Set REQUESTED_DATE=20260717
-    # to point everything at the 17th for a live end-to-end test.
-    if cfg.get("url_template") and cfg.get("requested_date"):
-        cfg["target_url"] = cfg["url_template"].format(date=cfg["requested_date"])
+    # BMS bakes the date into the URL path, so stitch the final page
+    # address together from the template + whichever date we're chasing.
+    if settings.get("url_template") and settings.get("requested_date"):
+        settings["target_url"] = settings["url_template"].format(
+            date=settings["requested_date"]
+        )
 
-    required = ["target_url", "telegram_bot_token", "telegram_chat_id"]
-    detector = cfg.get("detector")
-    if detector in ("bms_date", "venue_date"):
-        required.append("requested_date")
-    elif detector != "venue_date":
-        required.append("theatre")
-    if detector == "venue_date" and not (cfg.get("venue_code") or cfg.get("venue_codes")):
-        sys.exit("venue_date detector needs 'venue_code' or 'venue_codes'")
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        sys.exit(f"Missing required config: {', '.join(missing)}")
-    return cfg
+    needed = ["target_url", "telegram_bot_token", "telegram_chat_id"]
+    mode = settings.get("detector")
+    if mode in ("bms_date", "venue_date"):
+        needed.append("requested_date")
+    elif mode != "venue_date":
+        needed.append("theatre")
+    if mode == "venue_date" and not (settings.get("venue_code") or settings.get("venue_codes")):
+        sys.exit("venue_date mode needs 'venue_code' or 'venue_codes' set in config.json")
+
+    absent = [key for key in needed if not settings.get(key)]
+    if absent:
+        sys.exit(f"config.json is missing: {', '.join(absent)}")
+    return settings
 
 
-def send_telegram(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = requests.post(
-        url,
-        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
+def notify_telegram(bot_token, chat_id, message):
+    endpoint = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    response = requests.post(
+        endpoint,
+        json={"chat_id": chat_id, "text": message, "disable_web_page_preview": False},
         timeout=30,
     )
-    resp.raise_for_status()
+    response.raise_for_status()
 
 
-def fetch(cfg):
+def grab_page(settings):
     """
-    Fetch the target URL from an India egress when configured.
+    Pull down the target BMS page, routed through an India IP when possible.
 
-    BookMyShow blocks non-India / datacenter IPs (e.g. GitHub's US runners),
-    so a plain request from CI gets a 403. Two ways to route through India:
+    BookMyShow rejects non-India / datacenter traffic outright (GitHub's
+    runners get a flat 403), so this goes through one of two workarounds:
 
-    * SCRAPERAPI_KEY  -- routes via ScraperAPI with country_code=in and solves
-                         anti-bot. Easiest for CI. Set it as a repo secret.
-    * PROXY_URL       -- a standard http(s) proxy string, e.g.
-                         "http://user:pass@in-proxy-host:port".
+    * SCRAPERAPI_KEY — proxies the request via ScraperAPI with
+      country_code=in and handles anti-bot checks. Set as a repo secret.
+    * PROXY_URL — a plain http(s) proxy string pointed at an India exit.
 
-    With neither set, it makes a direct request with browser headers plus a
-    cookie warm-up -- enough only when running from an India IP.
+    With neither secret set, it falls back to a direct request with
+    browser-shaped headers plus a homepage warm-up — only reliable if the
+    machine running this is itself in India.
     """
-    headers = dict(DEFAULT_HEADERS)
-    headers.update(cfg.get("headers", {}))
+    headers = dict(BROWSER_HEADERS)
+    headers.update(settings.get("headers", {}))
 
     scraper_key = os.environ.get("SCRAPERAPI_KEY")
     if scraper_key:
-        api_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(
-            {"api_key": scraper_key, "country_code": "in", "url": cfg["target_url"]}
+        proxied_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(
+            {"api_key": scraper_key, "country_code": "in", "url": settings["target_url"]}
         )
-        resp = requests.get(api_url, timeout=90)
-        resp.raise_for_status()
-        return resp.text
+        response = requests.get(proxied_url, timeout=90)
+        response.raise_for_status()
+        return response.text
 
-    proxy = os.environ.get("PROXY_URL")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+    proxy_url = os.environ.get("PROXY_URL")
+    proxy_config = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
-    session = requests.Session()
-    session.headers.update(headers)
+    browser_session = requests.Session()
+    browser_session.headers.update(headers)
 
-    # Warm-up: hit the homepage first to pick up cookies (helps soft bot checks).
     try:
-        session.get("https://in.bookmyshow.com/", timeout=30, proxies=proxies)
+        browser_session.get("https://in.bookmyshow.com/", timeout=30, proxies=proxy_config)
     except requests.RequestException:
-        pass
+        pass  # warm-up cookie grab failing isn't fatal, just less convincing
 
-    resp = session.get(
-        cfg["target_url"],
+    response = browser_session.get(
+        settings["target_url"],
         timeout=30,
-        proxies=proxies,
+        proxies=proxy_config,
         headers={"Referer": "https://in.bookmyshow.com/explore/movies-chennai"},
     )
-    resp.raise_for_status()
-    return resp.text
+    response.raise_for_status()
+    return response.text
 
 
-def is_available_bms_date(page_text, cfg):
+def check_date_open_anywhere(page_html, settings):
     """
-    BookMyShow-specific detector for "a given date has opened for booking".
+    'Does this date have showtimes at ANY theatre yet' detector.
 
-    BMS only renders showtimes for the date currently being displayed, and it
-    silently falls back to the nearest available date when you request a date
-    that hasn't opened yet. So the requested date (e.g. 20260720) sits at a
-    low ~3 count (just the date-strip navigation) until it opens, at which
-    point its showtimes render and it becomes the *dominant* date token.
-
-    Rule: open when the requested date is the most-referenced date token on
-    the page and it clears a small floor (well above strip-only noise).
+    BMS quietly swaps in the nearest bookable date when you ask for one
+    that isn't live yet, so the date we actually want stays a low-count
+    background token (just nav-strip mentions) until it goes live — at
+    which point real showtimes render and it becomes the page's single
+    most-repeated date.
     """
-    requested = cfg["requested_date"]  # e.g. "20260720"
-    floor = cfg.get("min_references", 10)
+    target_date = settings["requested_date"]
+    min_hits = settings.get("min_references", 10)
 
-    tokens = re.findall(r"20\d{6}", page_text)
-    if not tokens:
+    date_tokens = re.findall(r"20\d{6}", page_html)
+    if not date_tokens:
         return False
 
-    counts = Counter(tokens)
-    top_date, _ = counts.most_common(1)[0]
-    requested_count = counts.get(requested, 0)
+    tally = Counter(date_tokens)
+    leading_date, _ = tally.most_common(1)[0]
+    target_hits = tally.get(target_date, 0)
 
-    return top_date == requested and requested_count >= floor
+    return leading_date == target_date and target_hits >= min_hits
 
 
-def is_available_venue_date(page_text, cfg):
+def check_venue_open(page_html, settings):
     """
-    Theatre-specific detector: is a given venue bookable on a given date?
+    'Is THIS theatre bookable on THIS date' detector.
 
-    BMS renders a per-venue booking link like
-        /cinemas/chennai/<slug>/buytickets/<venueCode>/<date>
-    only when that venue has live shows for that exact date. Because the date
-    is baked into the link, it can't be confused with the silent fallback
-    (a fallback page carries /<code>/<fallbackDate>, not /<code>/<ourDate>).
-
-    Set venue_code (one) or venue_codes (list). With a list, it's open when
-    ANY of them is bookable for the date.
+    BMS only renders a venue's booking link (/cinemas/<city>/<slug>/
+    buytickets/<code>/<date>) once that venue has live shows for that
+    exact date — the date being baked into the link rules out false
+    positives from the silent fallback-date behavior above.
     """
-    date = cfg["requested_date"]
-    codes = cfg.get("venue_codes") or [cfg["venue_code"]]
-    return any("/{}/{}".format(code, date) in page_text for code in codes)
+    target_date = settings["requested_date"]
+    venue_codes = settings.get("venue_codes") or [settings["venue_code"]]
+    return any(f"/{code}/{target_date}" in page_html for code in venue_codes)
 
 
-def is_available(page_text, cfg):
-    detector = cfg.get("detector")
-    if detector == "venue_date":
-        return is_available_venue_date(page_text, cfg)
-    if detector == "bms_date":
-        return is_available_bms_date(page_text, cfg)
-    return is_available_generic(page_text, cfg)
-
-
-def is_available_generic(page_text, cfg):
+def check_generic_open(page_html, settings):
     """
-    Booking is considered OPEN for the target theatre when the theatre name
-    is present AND at least one 'booking is live' signal is present.
-
-    Matching is case-insensitive and ignores extra whitespace so small
-    formatting differences don't cause misses.
+    Fallback detector: theatre name + movie name both present, plus a
+    'booking is live' phrase, and no 'not yet open' phrase dominating.
     """
-    haystack = re.sub(r"\s+", " ", page_text).lower()
+    flat_text = re.sub(r"\s+", " ", page_html).lower()
 
-    theatre = re.sub(r"\s+", " ", cfg["theatre"]).lower().strip()
-    if theatre not in haystack:
+    theatre_name = re.sub(r"\s+", " ", settings["theatre"]).lower().strip()
+    if theatre_name not in flat_text:
         return False
 
-    # If the movie name is configured, require it too (avoids false hits when
-    # the theatre is listed for other movies).
-    movie = cfg.get("movie")
-    if movie:
-        if re.sub(r"\s+", " ", movie).lower().strip() not in haystack:
-            return False
+    movie_name = settings.get("movie")
+    if movie_name and re.sub(r"\s+", " ", movie_name).lower().strip() not in flat_text:
+        return False
 
-    # Signals that booking is actually live rather than "coming soon".
-    open_signals = cfg.get(
+    open_phrases = settings.get(
         "open_signals",
         ["book tickets", "book now", '"showtimes"', "showtime", "select seats"],
     )
-    # Signals that it's NOT yet open -- if present near-exclusively, treat as closed.
-    closed_signals = cfg.get("closed_signals", ["notify me", "coming soon"])
+    closed_phrases = settings.get("closed_signals", ["notify me", "coming soon"])
 
-    has_open = any(s.lower() in haystack for s in open_signals)
-    only_closed = any(s.lower() in haystack for s in closed_signals) and not has_open
+    looks_open = any(phrase.lower() in flat_text for phrase in open_phrases)
+    looks_closed_only = any(phrase.lower() in flat_text for phrase in closed_phrases) and not looks_open
 
-    return has_open and not only_closed
+    return looks_open and not looks_closed_only
 
 
-def main():
-    cfg = load_config()
-    state = load_json(STATE_PATH, default={"available": False}) or {"available": False}
+def is_booking_open(page_html, settings):
+    mode = settings.get("detector")
+    if mode == "venue_date":
+        return check_venue_open(page_html, settings)
+    if mode == "bms_date":
+        return check_date_open_anywhere(page_html, settings)
+    return check_generic_open(page_html, settings)
 
-    target_desc = cfg.get("theatre") or cfg.get("requested_date", "target")
-    label = f"{cfg.get('movie', 'movie')} @ {target_desc}"
+
+def build_alert_text(settings):
+    if settings.get("detector") in ("bms_date", "venue_date"):
+        raw_date = settings["requested_date"]
+        pretty_date = f"{raw_date[6:8]}-{raw_date[4:6]}-{raw_date[0:4]}"
+        venue_bit = settings.get("venue_label") or settings.get("venue_code") or ""
+        venue_line = f"📍 {venue_bit}\n" if venue_bit else ""
+        return (
+            f"🕷️ Tickets are LIVE!\n\n"
+            f"{settings.get('movie', 'Movie')}\n"
+            f"{venue_line}"
+            f"📅 {pretty_date}\n\n"
+            f"👉 {settings['target_url']}"
+        )
+    return (
+        f"🎟️ Booking just opened!\n\n"
+        f"{settings.get('movie', 'Movie')}\n"
+        f"📍 {settings['theatre']}\n\n"
+        f"👉 {settings['target_url']}"
+    )
+
+
+def run():
+    settings = get_settings()
+    memory = read_json(MEMORY_FILE, fallback={"available": False}) or {"available": False}
+
+    watch_label = f"{settings.get('movie', 'target')} :: {settings.get('theatre') or settings.get('requested_date', '?')}"
 
     try:
-        page = fetch(cfg)
-    except requests.RequestException as exc:
-        # Transient network/blocking errors shouldn't crash the workflow.
-        print(f"[{label}] fetch failed: {exc}")
+        page_html = grab_page(settings)
+    except requests.RequestException as err:
+        # A blocked/failed fetch shouldn't fail the whole workflow run.
+        print(f"[watch] {watch_label} -- fetch failed: {err}")
         return 0
 
-    available = is_available(page, cfg)
-    print(f"[{label}] available={available} (was {state.get('available')})")
+    open_now = is_booking_open(page_html, settings)
+    print(f"[watch] {watch_label} -- open_now={open_now} (previously={memory.get('available')})")
 
-    if available and not state.get("available"):
-        if cfg.get("detector") in ("bms_date", "venue_date"):
-            rd = cfg["requested_date"]
-            pretty = f"{rd[6:8]}-{rd[4:6]}-{rd[0:4]}"
-            venue = cfg.get("venue_label") or cfg.get("venue_code") or ""
-            venue_line = f"Theatre: {venue}\n" if venue else ""
-            msg = (
-                f"🎬 Booking just OPENED!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"{venue_line}"
-                f"Date: {pretty}\n\n"
-                f"Book here: {cfg['target_url']}"
-            )
-        else:
-            msg = (
-                f"🎬 Booking is OPEN!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"Theatre: {cfg['theatre']}\n\n"
-                f"Book here: {cfg['target_url']}"
-            )
-        send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
-        print(f"[{label}] notification sent")
+    if open_now and not memory.get("available"):
+        notify_telegram(
+            settings["telegram_bot_token"],
+            settings["telegram_chat_id"],
+            build_alert_text(settings),
+        )
+        print(f"[watch] {watch_label} -- alert sent")
 
-    # Persist current state so we don't re-alert every run.
-    if available != state.get("available"):
-        state["available"] = available
-        state["checked_at"] = int(time.time())
-        save_json(STATE_PATH, state)
+    if open_now != memory.get("available"):
+        memory["available"] = open_now
+        memory["checked_at"] = int(time.time())
+        write_json(MEMORY_FILE, memory)
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())
